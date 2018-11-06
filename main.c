@@ -49,6 +49,7 @@
  */
 
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include "nordic_common.h"
@@ -68,6 +69,12 @@
 #include "app_util_platform.h"
 #include "bsp_btn_ble.h"
 #include "nrf_pwr_mgmt.h"
+
+#include "boards.h"
+#include "bmi160.h"
+#include "nrf_delay.h"
+#include "nrf_drv_gpiote.h"
+#include "nrf_drv_spi.h"
 
 #if defined (UART_PRESENT)
 #include "nrf_uart.h"
@@ -105,6 +112,15 @@
 #define UART_RX_BUF_SIZE                256                                         /**< UART RX buffer size. */
 
 
+/* For SPI */
+#define SPI_INSTANCE 0 // SPI instance index. We use SPI master 0
+#define SPI_SS_PIN 26
+#define SPI_MISO_PIN 23
+#define SPI_MOSI_PIN 24
+#define SPI_SCK_PIN 22
+#define INTERRUPT_PIN 27
+
+
 BLE_NUS_DEF(m_nus, NRF_SDH_BLE_TOTAL_LINK_COUNT);                                   /**< BLE NUS service instance. */
 NRF_BLE_GATT_DEF(m_gatt);                                                           /**< GATT module instance. */
 NRF_BLE_QWR_DEF(m_qwr);                                                             /**< Context for the Queued Write module.*/
@@ -117,6 +133,17 @@ static ble_uuid_t m_adv_uuids[]          =                                      
     {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE}
 };
 
+/* 
+    For SPI 
+*/
+
+uint8_t fifo_buff[200];                                                 // Declare memory to store the raw FIFO buffer information
+struct bmi160_fifo_frame fifo_frame;                                    // Modify the FIFO buffer instance and link to the device instance
+static const nrf_drv_spi_t spi = NRF_DRV_SPI_INSTANCE(SPI_INSTANCE);    // SPI instance
+static volatile bool spi_xfer_done;                                     // Flag used to indicate that SPI instance completed the transfer
+static uint8_t SPI_RX_Buffer[201];                                      // Allocate a buffer for SPI reads
+struct bmi160_dev sensor;                                               // An instance of bmi160 sensor
+struct bmi160_sensor_data acc_data[28];                                 // 200 bytes -> ~7bytes per frame -> ~28 data frames
 
 /**@brief Function for assert macro callback.
  *
@@ -689,6 +716,184 @@ static void advertising_start(void)
     APP_ERROR_CHECK(err_code);
 }
 
+/////////////////////////////////////////////////////////////////////////////////
+
+/**
+* Function for reading FIFO data
+*/
+int8_t get_bmi160_fifo_data()
+{
+    int8_t rslt = BMI160_OK;
+    uint8_t acc_frames_req = 28;
+    // Read the fifo buffer using SPI
+    rslt = bmi160_get_fifo_data(&sensor);
+    // Parse the data and extract 28 gyro frames
+    rslt = bmi160_extract_accel(acc_data, &acc_frames_req, &sensor);
+    
+    return rslt;
+}
+
+/**
+* Function for writing to the BMI160 via SPI.
+*/
+int8_t bmi160_spi_bus_write(uint8_t hw_addr, uint8_t reg_addr, uint8_t *reg_data, uint16_t cnt)
+{
+    spi_xfer_done = false; // set the flag down during transfer
+    int32_t error = 0;
+    // Allocate array, which lenght is address + number of data bytes to be sent
+    uint8_t tx_buff[cnt+1];
+    uint16_t stringpos;
+    // AND address with 0111 1111; set msb to '0' (write operation)
+    tx_buff[0] = reg_addr & 0x7F;
+    for (stringpos = 0; stringpos < cnt; stringpos++) {
+        tx_buff[stringpos+1] = *(reg_data + stringpos);
+    }
+    // Do the actual SPI transfer
+    nrf_drv_spi_transfer(&spi, tx_buff, cnt+1, NULL, 0);
+    while (!spi_xfer_done) {}; // Loop until the transfer is complete
+    return (int8_t)error;
+}
+
+/**
+* Function for reading from the BMI160 via SPI.
+*/
+int8_t bmi160_spi_bus_read(uint8_t hw_addr, uint8_t reg_addr, uint8_t *reg_data, uint16_t len)
+{
+    spi_xfer_done = false; // set the flag down during transfer
+    int32_t error = 0;
+    uint8_t tx_buff = reg_addr | 0x80; // OR address with 1000 0000; Read -> set msb to '1';
+    uint8_t * rx_buff_pointer;
+    uint16_t stringpos;
+    rx_buff_pointer = (uint8_t *) (SPI_RX_Buffer);
+    // Do the actual SPI transfer
+    nrf_drv_spi_transfer(&spi, &tx_buff, 1, rx_buff_pointer, len+1);
+    while (!spi_xfer_done) {} // Loop until the transfer is complete
+    // Copy received bytes to reg_data
+    for (stringpos = 0; stringpos < len; stringpos++)
+        *(reg_data + stringpos) = SPI_RX_Buffer[stringpos + 1];
+    return (int8_t)error;
+}
+
+/**
+* Handler for GPIO events.
+*/
+void interrupt_handler(nrf_drv_gpiote_pin_t pin, nrf_gpiote_polarity_t action)
+{
+    get_bmi160_fifo_data();
+}
+
+/**
+* SPI user event handler.
+*/
+void spi_event_handler(nrf_drv_spi_evt_t const * p_event, void * p_context)
+{
+    spi_xfer_done = true; // Set a flag when transfer is done
+}
+
+/**
+* Function for configuring General Purpose I/O.
+*/
+uint32_t config_gpio()
+{
+    uint32_t err_code = NRF_SUCCESS;
+    if(!nrf_drv_gpiote_is_init())
+    {
+        err_code = nrf_drv_gpiote_init();
+    }
+    // Set which clock edge triggers the interrupt
+    nrf_drv_gpiote_in_config_t config = GPIOTE_CONFIG_IN_SENSE_LOTOHI(true);
+    // Configure the internal pull up resistor
+    config.pull = NRF_GPIO_PIN_NOPULL;
+    // Configure the pin as input
+    err_code = nrf_drv_gpiote_in_init(INTERRUPT_PIN, &config, interrupt_handler);
+    if (err_code != NRF_SUCCESS)
+    {
+        // handle error condition
+    }
+    // Enable events
+    nrf_drv_gpiote_in_event_enable(INTERRUPT_PIN, true);
+    return err_code;
+}
+
+/**
+* Function for setting up the SPI communication.
+*/
+uint32_t spi_config()
+{
+    uint32_t err_code;
+    
+    // Use nRF's default configurations
+    nrf_drv_spi_config_t spi_config = NRF_DRV_SPI_DEFAULT_CONFIG;
+    
+    // Define each GPIO pin
+    spi_config.ss_pin = SPI_SS_PIN;
+    spi_config.miso_pin = SPI_MISO_PIN;
+    spi_config.mosi_pin = SPI_MOSI_PIN;
+    spi_config.sck_pin = SPI_SCK_PIN;
+    
+    // Initialize the SPI peripheral and give it a function pointer to
+    // it’s event handler
+    err_code = nrf_drv_spi_init(&spi, &spi_config, spi_event_handler, NULL);
+    
+    return err_code;
+}
+
+/**
+* Function for configuring the sensor
+*/
+int8_t sensor_config()
+{
+    int8_t rslt = BMI160_OK;
+    sensor.id = 0; // We use SPI so id == 0
+    sensor.interface = BMI160_SPI_INTF; 
+    // Give the driver the correct interfacing functions
+    sensor.read = bmi160_spi_bus_read;
+    sensor.write = bmi160_spi_bus_write;
+    sensor.delay_ms = nrf_delay_ms;
+    // Initialize the sensor and check if everything went ok
+    rslt = bmi160_init(&sensor);
+    
+    
+    // Configure the accelerometer's sampling freq, range and modes
+    sensor.accel_cfg.odr = BMI160_ACCEL_ODR_200HZ;
+    sensor.accel_cfg.range = BMI160_ACCEL_RANGE_8G;
+    sensor.accel_cfg.bw = BMI160_ACCEL_BW_NORMAL_AVG4;
+    sensor.accel_cfg.power = BMI160_ACCEL_NORMAL_MODE;
+    // Set the configurations
+    rslt = bmi160_set_sens_conf(&sensor);
+    // Some fifo settings
+    fifo_frame.data = fifo_buff;
+    fifo_frame.length = 200;
+    sensor.fifo = &fifo_frame;
+    // Configure the sensor's FIFO settings
+    rslt = bmi160_set_fifo_config(BMI160_FIFO_ACCEL, BMI160_ENABLE, &sensor);
+    // Create an instance for interrupt settings
+    struct bmi160_int_settg int_config;
+    // Interrupt channel/pin 1
+    int_config.int_channel = BMI160_INT_CHANNEL_1;
+    // Choosing fifo watermark interrupt
+    int_config.int_type = BMI160_ACC_GYRO_FIFO_WATERMARK_INT;
+    // Set fifo watermark level to 180
+    rslt = bmi160_set_fifo_wm((uint8_t) 180, &sensor);
+    // Enabling interrupt pins to act as output pin
+    int_config.int_pin_settg.output_en = BMI160_ENABLE;
+    // Choosing push-pull mode for interrupt pin
+    int_config.int_pin_settg.output_mode = BMI160_DISABLE;
+    // Choosing active high output
+    int_config.int_pin_settg.output_type = BMI160_ENABLE;
+    // Choosing edge triggered output
+    int_config.int_pin_settg.edge_ctrl = BMI160_ENABLE;
+    // Disabling interrupt pin to act as input
+    int_config.int_pin_settg.input_en = BMI160_DISABLE;
+    // Non-latched output
+    int_config.int_pin_settg.latch_dur = BMI160_LATCH_DUR_NONE;
+    // Enabling FIFO watermark interrupt
+    int_config.fifo_WTM_int_en = BMI160_ENABLE;
+    // Set interrupt configurations
+    rslt = bmi160_set_int_config(&int_config, &sensor);
+    
+    return rslt;
+}
 
 /**@brief Application main function.
  */
@@ -698,7 +903,7 @@ int main(void)
 
     // Initialize.
     uart_init();
-    log_init();
+    // log_init();
     timers_init();
     buttons_leds_init(&erase_bonds);
     power_management_init();
@@ -709,6 +914,22 @@ int main(void)
     advertising_init();
     conn_params_init();
 
+    
+    uint32_t err_code = spi_config();
+    if (err_code != NRF_SUCCESS) {
+        return 1;
+    }
+    int8_t rslt = sensor_config();
+    if (rslt != BMI160_OK) {
+        return 1;
+    }
+    err_code = config_gpio();
+    if (err_code != NRF_SUCCESS)
+    {
+        return 1;
+    }
+    
+    
     // Start execution.
     printf("\r\nUART started.\r\n");
     NRF_LOG_INFO("Debug logging for UART over RTT started.");
