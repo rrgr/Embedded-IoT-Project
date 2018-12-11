@@ -49,7 +49,6 @@
  */
 
 
-#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include "nordic_common.h"
@@ -75,27 +74,15 @@
 #include "nrf_delay.h"
 #include "nrf_drv_gpiote.h"
 #include "nrf_drv_spi.h"
+#include "ble_cus.h"
 
-#if defined (UART_PRESENT)
-#include "nrf_uart.h"
-#endif
-#if defined (UARTE_PRESENT)
-#include "nrf_uarte.h"
-#endif
-
-#include "nrf_log.h"
-#include "nrf_log_ctrl.h"
-#include "nrf_log_default_backends.h"
 
 #define APP_BLE_CONN_CFG_TAG            1                                           /**< A tag identifying the SoftDevice BLE configuration. */
 
-#define DEVICE_NAME                     "Nordic_UART"                               /**< Name of device. Will be included in the advertising data. */
-#define NUS_SERVICE_UUID_TYPE           BLE_UUID_TYPE_VENDOR_BEGIN                  /**< UUID type for the Nordic UART Service (vendor specific). */
+#define DEVICE_NAME                     "NRF"                               /**< Name of device. Will be included in the advertising data. */
 
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
-
 #define APP_ADV_INTERVAL                64                                          /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
-
 #define APP_ADV_DURATION                18000                                       /**< The advertising duration (180 seconds) in units of 10 milliseconds. */
 
 #define MIN_CONN_INTERVAL               MSEC_TO_UNITS(20, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (20 ms), Connection interval uses 1.25 ms units. */
@@ -108,43 +95,102 @@
 
 #define DEAD_BEEF                       0xDEADBEEF                                  /**< Value used as error code on stack dump, can be used to identify stack location on stack unwind. */
 
-#define UART_TX_BUF_SIZE                256                                         /**< UART TX buffer size. */
-#define UART_RX_BUF_SIZE                256                                         /**< UART RX buffer size. */
-
-
-/* For SPI */
-#define SPI_INSTANCE 0 // SPI instance index. We use SPI master 0
-#define SPI_SS_PIN 26
-#define SPI_MISO_PIN 23
-#define SPI_MOSI_PIN 24
-#define SPI_SCK_PIN 22
-#define INTERRUPT_PIN 27
-
+#define NOTIFICATION_INTERVAL           APP_TIMER_TICKS(1000)
 
 BLE_NUS_DEF(m_nus, NRF_SDH_BLE_TOTAL_LINK_COUNT);                                   /**< BLE NUS service instance. */
 NRF_BLE_GATT_DEF(m_gatt);                                                           /**< GATT module instance. */
 NRF_BLE_QWR_DEF(m_qwr);                                                             /**< Context for the Queued Write module.*/
 BLE_ADVERTISING_DEF(m_advertising);                                                 /**< Advertising module instance. */
+BLE_CUS_DEF(m_cus);                                                             /**< Add custom service instance. */
+APP_TIMER_DEF(m_notification_timer_id);
 
 static uint16_t   m_conn_handle          = BLE_CONN_HANDLE_INVALID;                 /**< Handle of the current connection. */
-static uint16_t   m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3;            /**< Maximum length of data (in bytes) that can be transmitted to the peer by the Nordic UART service module. */
-static ble_uuid_t m_adv_uuids[]          =                                          /**< Universally unique service identifier. */
+static ble_uuid_t m_adv_uuids[] =                                                   /**< Universally unique service identifiers. */
 {
-    {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE}
+    {CUSTOM_SERVICE_UUID, BLE_UUID_TYPE_VENDOR_BEGIN}
 };
 
-/* 
-    For SPI 
-*/
+static uint8_t m_custom_value = 0;
 
-uint8_t fifo_buff[200];                                                 // Declare memory to store the raw FIFO buffer information
-struct bmi160_fifo_frame fifo_frame;                                    // Modify the FIFO buffer instance and link to the device instance
-static const nrf_drv_spi_t spi = NRF_DRV_SPI_INSTANCE(SPI_INSTANCE);    // SPI instance
-static volatile bool spi_xfer_done;                                     // Flag used to indicate that SPI instance completed the transfer
-static uint8_t SPI_RX_Buffer[201];                                      // Allocate a buffer for SPI reads
-struct bmi160_dev sensor;                                               // An instance of bmi160 sensor
 struct bmi160_sensor_data acc_data[28];                                 // 200 bytes -> ~7bytes per frame -> ~28 data frames
 
+/**@brief Function for handling the Battery measurement timer timeout.
+ *
+ * @details This function will be called each time the battery level measurement timer expires.
+ *
+ * @param[in] p_context  Pointer used for passing some arbitrary information (context) from the
+ *                       app_start_timer() call to the timeout handler.
+ */
+static void notification_timeout_handler(void * p_context)
+{
+    UNUSED_PARAMETER(p_context);
+    ret_code_t err_code;
+    
+    // Increment the value of m_custom_value before nortifing it.
+    //uint16_t x = acc_data[1].x;
+    //uint16_t y = acc_data[1].y;
+    //uint16_t z = acc_data[1].z;
+    //char buffer[20];
+    //snprintf(buffer, sizeof(buffer), "x=%d, y=%d, z=%d", x, y, z);
+    m_custom_value = acc_data[1].x;
+    
+    err_code = ble_cus_custom_value_update(&m_cus, m_custom_value);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+/**@brief Function for the Timer initialization.
+ *
+ * @details Initializes the timer module. This creates and starts application timers.
+ */
+static void timers_init(void)
+{
+    // Initialize timer module.
+    ret_code_t err_code = app_timer_init();
+    APP_ERROR_CHECK(err_code);
+
+    err_code = app_timer_create(&m_notification_timer_id, APP_TIMER_MODE_REPEATED, notification_timeout_handler);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+/**@brief Function for handling the Custom Service Service events.
+ *
+ * @details This function will be called for all Custom Service events which are passed to
+ *          the application.
+ *
+ * @param[in]   p_cus_service  Custom Service structure.
+ * @param[in]   p_evt          Event received from the Custom Service.
+ *
+ */
+static void on_cus_evt(ble_cus_t     * p_cus_service,
+                       ble_cus_evt_t * p_evt)
+{
+    uint8_t err_code;
+    
+    switch(p_evt->evt_type)
+    {
+        case BLE_CUS_EVT_NOTIFICATION_ENABLED:
+            err_code = app_timer_start(m_notification_timer_id, NOTIFICATION_INTERVAL, NULL);
+            APP_ERROR_CHECK(err_code);
+            break;
+
+        case BLE_CUS_EVT_NOTIFICATION_DISABLED:
+            err_code = app_timer_stop(m_notification_timer_id);
+            APP_ERROR_CHECK(err_code);
+            break;
+        
+        case BLE_CUS_EVT_CONNECTED:
+            break;
+
+        case BLE_CUS_EVT_DISCONNECTED:
+            break;
+
+        default:
+              // No implementation needed.
+              break;
+    }
+}
 /**@brief Function for assert macro callback.
  *
  * @details This function will be called in case of an assert in the SoftDevice.
@@ -159,14 +205,6 @@ struct bmi160_sensor_data acc_data[28];                                 // 200 b
 void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
 {
     app_error_handler(DEAD_BEEF, line_num, p_file_name);
-}
-
-/**@brief Function for initializing the timer module.
- */
-static void timers_init(void)
-{
-    ret_code_t err_code = app_timer_init();
-    APP_ERROR_CHECK(err_code);
 }
 
 /**@brief Function for the GAP initialization.
@@ -211,53 +249,11 @@ static void nrf_qwr_error_handler(uint32_t nrf_error)
     APP_ERROR_HANDLER(nrf_error);
 }
 
-
-/**@brief Function for handling the data from the Nordic UART Service.
- *
- * @details This function will process the data received from the Nordic UART BLE Service and send
- *          it to the UART module.
- *
- * @param[in] p_evt       Nordic UART Service event.
- */
-/**@snippet [Handling the data received over BLE] */
-static void nus_data_handler(ble_nus_evt_t * p_evt)
-{
-
-    if (p_evt->type == BLE_NUS_EVT_RX_DATA)
-    {
-        uint32_t err_code;
-
-        NRF_LOG_DEBUG("Received data from BLE NUS. Writing data on UART.");
-        NRF_LOG_HEXDUMP_DEBUG(p_evt->params.rx_data.p_data, p_evt->params.rx_data.length);
-
-        for (uint32_t i = 0; i < p_evt->params.rx_data.length; i++)
-        {
-            do
-            {
-                err_code = app_uart_put(p_evt->params.rx_data.p_data[i]);
-                if ((err_code != NRF_SUCCESS) && (err_code != NRF_ERROR_BUSY))
-                {
-                    NRF_LOG_ERROR("Failed receiving NUS message. Error 0x%x. ", err_code);
-                    APP_ERROR_CHECK(err_code);
-                }
-            } while (err_code == NRF_ERROR_BUSY);
-        }
-        if (p_evt->params.rx_data.p_data[p_evt->params.rx_data.length - 1] == '\r')
-        {
-            while (app_uart_put('\n') == NRF_ERROR_BUSY);
-        }
-    }
-
-}
-/**@snippet [Handling the data received over BLE] */
-
-
 /**@brief Function for initializing services that will be used by the application.
  */
 static void services_init(void)
 {
     uint32_t           err_code;
-    ble_nus_init_t     nus_init;
     nrf_ble_qwr_init_t qwr_init = {0};
 
     // Initialize Queued Write Module.
@@ -266,12 +262,18 @@ static void services_init(void)
     err_code = nrf_ble_qwr_init(&m_qwr, &qwr_init);
     APP_ERROR_CHECK(err_code);
 
-    // Initialize NUS.
-    memset(&nus_init, 0, sizeof(nus_init));
-
-    nus_init.data_handler = nus_data_handler;
-
-    err_code = ble_nus_init(&m_nus, &nus_init);
+    // Initialize custom service
+    ble_cus_init_t cus_init;
+    
+    // Initialize CUS Service init structure to zero.
+    memset(&cus_init, 0, sizeof(cus_init));
+	
+    // Set the cus event handler
+    cus_init.evt_handler = on_cus_evt;
+    
+    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&cus_init.custom_value_char_attr_md.read_perm);
+    
+    err_code = ble_cus_init(&m_cus, &cus_init);
     APP_ERROR_CHECK(err_code);
 }
 
@@ -388,7 +390,6 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
     switch (p_ble_evt->header.evt_id)
     {
         case BLE_GAP_EVT_CONNECTED:
-            NRF_LOG_INFO("Connected");
             err_code = bsp_indication_set(BSP_INDICATE_CONNECTED);
             APP_ERROR_CHECK(err_code);
             m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
@@ -397,14 +398,12 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:
-            NRF_LOG_INFO("Disconnected");
             // LED indication will be changed when advertising starts.
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
             break;
 
         case BLE_GAP_EVT_PHY_UPDATE_REQUEST:
         {
-            NRF_LOG_DEBUG("PHY update request.");
             ble_gap_phys_t const phys =
             {
                 .rx_phys = BLE_GAP_PHY_AUTO,
@@ -473,26 +472,12 @@ static void ble_stack_init(void)
 }
 
 
-/**@brief Function for handling events from the GATT library. */
-void gatt_evt_handler(nrf_ble_gatt_t * p_gatt, nrf_ble_gatt_evt_t const * p_evt)
-{
-    if ((m_conn_handle == p_evt->conn_handle) && (p_evt->evt_id == NRF_BLE_GATT_EVT_ATT_MTU_UPDATED))
-    {
-        m_ble_nus_max_data_len = p_evt->params.att_mtu_effective - OPCODE_LENGTH - HANDLE_LENGTH;
-        NRF_LOG_INFO("Data len is set to 0x%X(%d)", m_ble_nus_max_data_len, m_ble_nus_max_data_len);
-    }
-    NRF_LOG_DEBUG("ATT MTU exchange completed. central 0x%x peripheral 0x%x",
-                  p_gatt->att_mtu_desired_central,
-                  p_gatt->att_mtu_desired_periph);
-}
-
-
 /**@brief Function for initializing the GATT library. */
 void gatt_init(void)
 {
     ret_code_t err_code;
 
-    err_code = nrf_ble_gatt_init(&m_gatt, gatt_evt_handler);
+    err_code = nrf_ble_gatt_init(&m_gatt, NULL);
     APP_ERROR_CHECK(err_code);
 
     err_code = nrf_ble_gatt_att_mtu_periph_set(&m_gatt, NRF_SDH_BLE_GATT_MAX_MTU_SIZE);
@@ -538,98 +523,6 @@ void bsp_event_handler(bsp_event_t event)
 }
 
 
-/**@brief   Function for handling app_uart events.
- *
- * @details This function will receive a single character from the app_uart module and append it to
- *          a string. The string will be be sent over BLE when the last character received was a
- *          'new line' '\n' (hex 0x0A) or if the string has reached the maximum data length.
- */
-/**@snippet [Handling the data received over UART] */
-void uart_event_handle(app_uart_evt_t * p_event)
-{
-    static uint8_t data_array[BLE_NUS_MAX_DATA_LEN];
-    static uint8_t index = 0;
-    uint32_t       err_code;
-
-    switch (p_event->evt_type)
-    {
-        case APP_UART_DATA_READY:
-            UNUSED_VARIABLE(app_uart_get(&data_array[index]));
-            index++;
-
-            if ((data_array[index - 1] == '\n') ||
-                (data_array[index - 1] == '\r') ||
-                (index >= m_ble_nus_max_data_len))
-            {
-                if (index > 1)
-                {
-                    NRF_LOG_DEBUG("Ready to send data over BLE NUS");
-                    NRF_LOG_HEXDUMP_DEBUG(data_array, index);
-
-                    do
-                    {
-                        uint16_t length = (uint16_t)index;
-                        err_code = ble_nus_data_send(&m_nus, data_array, &length, m_conn_handle);
-                        if ((err_code != NRF_ERROR_INVALID_STATE) &&
-                            (err_code != NRF_ERROR_RESOURCES) &&
-                            (err_code != NRF_ERROR_NOT_FOUND))
-                        {
-                            APP_ERROR_CHECK(err_code);
-                        }
-                    } while (err_code == NRF_ERROR_RESOURCES);
-                }
-
-                index = 0;
-            }
-            break;
-
-        case APP_UART_COMMUNICATION_ERROR:
-            APP_ERROR_HANDLER(p_event->data.error_communication);
-            break;
-
-        case APP_UART_FIFO_ERROR:
-            APP_ERROR_HANDLER(p_event->data.error_code);
-            break;
-
-        default:
-            break;
-    }
-}
-/**@snippet [Handling the data received over UART] */
-
-
-/**@brief  Function for initializing the UART module.
- */
-/**@snippet [UART Initialization] */
-static void uart_init(void)
-{
-    uint32_t                     err_code;
-    app_uart_comm_params_t const comm_params =
-    {
-        .rx_pin_no    = RX_PIN_NUMBER,
-        .tx_pin_no    = TX_PIN_NUMBER,
-        .rts_pin_no   = RTS_PIN_NUMBER,
-        .cts_pin_no   = CTS_PIN_NUMBER,
-        .flow_control = APP_UART_FLOW_CONTROL_DISABLED,
-        .use_parity   = false,
-#if defined (UART_PRESENT)
-        .baud_rate    = NRF_UART_BAUDRATE_115200
-#else
-        .baud_rate    = NRF_UARTE_BAUDRATE_115200
-#endif
-    };
-
-    APP_UART_FIFO_INIT(&comm_params,
-                       UART_RX_BUF_SIZE,
-                       UART_TX_BUF_SIZE,
-                       uart_event_handle,
-                       APP_IRQ_PRIORITY_LOWEST,
-                       err_code);
-    APP_ERROR_CHECK(err_code);
-}
-/**@snippet [UART Initialization] */
-
-
 /**@brief Function for initializing the Advertising functionality.
  */
 static void advertising_init(void)
@@ -658,35 +551,6 @@ static void advertising_init(void)
 }
 
 
-/**@brief Function for initializing buttons and leds.
- *
- * @param[out] p_erase_bonds  Will be true if the clear bonding button was pressed to wake the application up.
- */
-static void buttons_leds_init(bool * p_erase_bonds)
-{
-    bsp_event_t startup_event;
-
-    uint32_t err_code = bsp_init(BSP_INIT_LEDS | BSP_INIT_BUTTONS, bsp_event_handler);
-    APP_ERROR_CHECK(err_code);
-
-    err_code = bsp_btn_ble_init(NULL, &startup_event);
-    APP_ERROR_CHECK(err_code);
-
-    *p_erase_bonds = (startup_event == BSP_EVENT_CLEAR_BONDING_DATA);
-}
-
-
-/**@brief Function for initializing the nrf log module.
- */
-static void log_init(void)
-{
-    ret_code_t err_code = NRF_LOG_INIT(NULL);
-    APP_ERROR_CHECK(err_code);
-
-    NRF_LOG_DEFAULT_BACKENDS_INIT();
-}
-
-
 /**@brief Function for initializing power management.
  */
 static void power_management_init(void)
@@ -694,17 +558,6 @@ static void power_management_init(void)
     ret_code_t err_code;
     err_code = nrf_pwr_mgmt_init();
     APP_ERROR_CHECK(err_code);
-}
-
-
-/**@brief Function for handling the idle state (main loop).
- *
- * @details If there is no pending log operation, then sleep until next the next event occurs.
- */
-static void idle_state_handle(void)
-{
-    UNUSED_RETURN_VALUE(NRF_LOG_PROCESS());
-    nrf_pwr_mgmt_run();
 }
 
 
@@ -717,12 +570,30 @@ static void advertising_start(void)
 }
 
 /////////////////////////////////////////////////////////////////////////////////
+/* 
+    For SPI 
+*/
+
+#define SPI_INSTANCE 0 // SPI instance index. We use SPI master 0
+#define SPI_SS_PIN 26
+#define SPI_MISO_PIN 23
+#define SPI_MOSI_PIN 24
+#define SPI_SCK_PIN 22
+#define INTERRUPT_PIN 27
+
+uint8_t fifo_buff[200];                                                 // Declare memory to store the raw FIFO buffer information
+struct bmi160_fifo_frame fifo_frame;                                    // Modify the FIFO buffer instance and link to the device instance
+static const nrf_drv_spi_t spi = NRF_DRV_SPI_INSTANCE(SPI_INSTANCE);    // SPI instance
+static volatile bool spi_xfer_done;                                     // Flag used to indicate that SPI instance completed the transfer
+static uint8_t SPI_RX_Buffer[201];                                      // Allocate a buffer for SPI reads
+struct bmi160_dev sensor;                                               // An instance of bmi160 sensor
+
 
 /**
 * Function for reading FIFO data
 */
 int8_t get_bmi160_fifo_data()
-{
+{    
     int8_t rslt = BMI160_OK;
     uint8_t acc_frames_req = 28;
     // Read the fifo buffer using SPI
@@ -853,7 +724,6 @@ int8_t sensor_config()
     // Initialize the sensor and check if everything went ok
     rslt = bmi160_init(&sensor);
     
-    
     // Configure the accelerometer's sampling freq, range and modes
     sensor.accel_cfg.odr = BMI160_ACCEL_ODR_200HZ;
     sensor.accel_cfg.range = BMI160_ACCEL_RANGE_8G;
@@ -895,17 +765,12 @@ int8_t sensor_config()
     return rslt;
 }
 
+
 /**@brief Application main function.
  */
 int main(void)
 {
-    bool erase_bonds;
-
-    // Initialize.
-    uart_init();
-    // log_init();
     timers_init();
-    buttons_leds_init(&erase_bonds);
     power_management_init();
     ble_stack_init();
     gap_params_init();
@@ -914,35 +779,25 @@ int main(void)
     advertising_init();
     conn_params_init();
 
-    
     uint32_t err_code = spi_config();
-    if (err_code != NRF_SUCCESS) {
+    if(err_code != NRF_SUCCESS) {
         return 1;
     }
     int8_t rslt = sensor_config();
-    if (rslt != BMI160_OK) {
+    if(rslt != BMI160_OK) {
         return 1;
     }
     err_code = config_gpio();
-    if (err_code != NRF_SUCCESS)
-    {
+    if(err_code != NRF_SUCCESS) {
         return 1;
     }
     
-    
     // Start execution.
-    printf("\r\nUART started.\r\n");
-    NRF_LOG_INFO("Debug logging for UART over RTT started.");
     advertising_start();
 
     // Enter main loop.
     for (;;)
     {
-        idle_state_handle();
+        __WFI();
     }
 }
-
-
-/**
- * @}
- */

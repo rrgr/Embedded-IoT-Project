@@ -3485,7 +3485,7 @@
  
 
 #ifndef NRFX_SPI0_ENABLED
-#define NRFX_SPI0_ENABLED 1
+#define NRFX_SPI0_ENABLED 0
 #endif
 
 // <q> NRFX_SPI1_ENABLED  - Enable SPI1 instance
@@ -5311,7 +5311,7 @@
 // <7=> 7 
 
 #ifndef SPI_DEFAULT_CONFIG_IRQ_PRIORITY
-#define SPI_DEFAULT_CONFIG_IRQ_PRIORITY 6
+#define SPI_DEFAULT_CONFIG_IRQ_PRIORITY 5
 #endif
 
 // <o> NRF_SPI_DRV_MISO_PULLUP_CFG  - MISO PIN pull-up configuration.
